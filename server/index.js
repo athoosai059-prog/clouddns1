@@ -102,6 +102,18 @@ app.delete('/api/zones/:zoneId/dns_records/:recordId', async (req, res) => {
     }
 });
 
+// Update DNS Record
+app.put('/api/zones/:zoneId/dns_records/:recordId', async (req, res) => {
+    try {
+        const response = await axios.put(`${CLOUDFLARE_API_URL}/zones/${req.params.zoneId}/dns_records/${req.params.recordId}`, req.body, {
+            headers: getHeaders(req)
+        });
+        res.json(response.data);
+    } catch (error) {
+        handleError(res, error);
+    }
+});
+
 // Bulk Create DNS Records
 app.post('/api/zones/:id/dns_records/bulk', async (req, res) => {
     const { records } = req.body;
