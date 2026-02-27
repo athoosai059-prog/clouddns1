@@ -31,7 +31,7 @@ import {
   EyeOff
 } from 'lucide-react';
 
-const API_BASE = 'http://localhost:3001/api';
+const API_BASE = '/api';
 const CACHE_TTL = 3600 * 1000;
 
 // All Cloudflare-supported DNS record types
