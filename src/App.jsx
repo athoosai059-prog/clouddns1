@@ -13,6 +13,7 @@ import {
   Loader2,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
   PlusCircle,
   MinusCircle,
   RefreshCw,
@@ -117,8 +118,8 @@ function App() {
   const [bulkRows, setBulkRows] = useState([]);
 
   // URL Forwarding State
-  const [redirectSource, setRedirectSource] = useState('');
-  const [redirectTarget, setRedirectTarget] = useState('');
+  const [redirectSource, setRedirectSource] = useState('{{DOMAIN}}/*');
+  const [redirectTarget, setRedirectTarget] = useState('https://');
 
   // Processing State
   const [isBulkProcessing, setIsBulkProcessing] = useState(false);
@@ -128,6 +129,15 @@ function App() {
   // Add Domains State
   const [domainsToAdd, setDomainsToAdd] = useState('');
   const [addedResults, setAddedResults] = useState([]);
+  const [totalZonesCount, setTotalZonesCount] = useState(0);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [isSyncingAll, setIsSyncingAll] = useState(false);
+  const [lastPageLoaded, setLastPageLoaded] = useState(1);
+
+  // Safety First State
+  const [safetyFreeze, setSafetyFreeze] = useState(0); // Countdown in seconds
+  const [lastRequestTime, setLastRequestTime] = useState(0);
+  const [requestQueueActive, setRequestQueueActive] = useState(false);
 
   // Search & Pagination
   const [searchMode, setSearchMode] = useState('simple');
@@ -145,46 +155,244 @@ function App() {
     setTimeout(() => setToast(null), 4000);
   }, []);
 
-  // Initialization & Caching logic
+  // Safety Timer Effect
+  useEffect(() => {
+    if (safetyFreeze > 0) {
+      const timer = setInterval(() => setSafetyFreeze(prev => prev - 1), 1000);
+      return () => clearInterval(timer);
+    }
+  }, [safetyFreeze]);
+
+  // Initialization: Fetch only first 50 domains to get total_count
   useEffect(() => {
     const cachedData = localStorage.getItem('cf_zones_cache');
     const cacheTime = localStorage.getItem('cf_zones_timestamp');
+    const cachedTotal = localStorage.getItem('cf_zones_total');
+
     if (cachedData && cacheTime && Date.now() - parseInt(cacheTime) < CACHE_TTL) {
-      setAllZones(JSON.parse(cachedData));
+      const parsed = JSON.parse(cachedData);
+      setAllZones(parsed);
+      if (cachedTotal) setTotalZonesCount(parseInt(cachedTotal));
+      // Resume sync if needed
+      const lastPage = parseInt(localStorage.getItem('cf_last_page') || '1');
+      setLastPageLoaded(lastPage);
     } else if (apiKey) {
-      fetchZones();
+      setTimeout(() => fetchZones(false, '', 1), 500);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiKey]);
 
-  const fetchZones = async (force = false) => {
-    if (!apiKey) return;
-    setLoading(true);
-    setError('');
+  // Automated Background Sync Trigger
+  useEffect(() => {
+    if (totalZonesCount > allZones.length && !searchTerm && apiKey && !isSyncingAll && safetyFreeze === 0) {
+      startBackgroundSync();
+    }
+  }, [totalZonesCount, allZones.length, searchTerm, apiKey, safetyFreeze]);
+
+  const startBackgroundSync = async () => {
+    if (isSyncingAll) return;
+    setIsSyncingAll(true);
+    let currentPageToLoad = lastPageLoaded + 1;
+    const totalPagesToLoad = Math.ceil(totalZonesCount / 50);
+
+    while (currentPageToLoad <= totalPagesToLoad) {
+      if (safetyFreeze > 0 || searchTerm) break;
+
+      const res = await fetchZones(false, '', currentPageToLoad);
+      if (!res) break; // Error or freeze
+
+      currentPageToLoad++;
+
+      // Save progress to localStorage every 10 pages (500 domains) to prevent data loss
+      if (currentPageToLoad % 10 === 0) {
+        localStorage.setItem('cf_last_page', (currentPageToLoad - 1).toString());
+      }
+    }
+    setIsSyncingAll(false);
+  };
+
+  // Safety Throttle Wrapper
+  const throttleRequest = async (action) => {
+    if (safetyFreeze > 0) {
+      showToast(`Account in Safety Freeze. Wait ${safetyFreeze}s`, 'error');
+      return null;
+    }
+
+    const now = Date.now();
+    const timeSinceLast = now - lastRequestTime;
+    const minBuffer = 1000; // Strict 1 second safety buffer
+
+    if (timeSinceLast < minBuffer) {
+      await new Promise(resolve => setTimeout(resolve, minBuffer - timeSinceLast));
+    }
+
+    setLastRequestTime(Date.now());
+    setRequestQueueActive(true);
+
     try {
-      const res = await axios.get(`${API_BASE}/zones`, { headers: { Authorization: apiKey } });
-      const zones = res.data.result || [];
-      setAllZones(zones);
-      localStorage.setItem('cf_zones_cache', JSON.stringify(zones));
-      localStorage.setItem('cf_zones_timestamp', Date.now().toString());
-      if (force) showToast('Zones synced successfully');
+      return await action();
     } catch (err) {
-      setError(err.response?.data?.error || 'Failed to sync zones');
+      if (err.response?.status === 429) {
+        setSafetyFreeze(60); // 60-second lockout on rate limit
+        showToast('Rate limit hit! Safety Freeze activated (60s)', 'error');
+      }
+      throw err;
+    } finally {
+      setRequestQueueActive(false);
+    }
+  };
+
+  const fetchZones = async (force = false, search = '', page = 1) => {
+    if (!apiKey || safetyFreeze > 0) return;
+
+    const isFirstPage = page === 1;
+    const cleanSearch = (search || '').trim();
+
+    if (isFirstPage) {
+      setLoading(true);
+      setError('');
+    }
+
+    try {
+      const res = await throttleRequest(() =>
+        axios.get(`${API_BASE}/zones`, {
+          headers: { Authorization: apiKey },
+          params: {
+            search: cleanSearch || undefined,
+            page: page,
+            per_page: 50
+          }
+        })
+      );
+
+      if (!res) return null;
+
+      const zones = res.data.result || [];
+      const info = res.data.result_info || {};
+
+      const compactZones = zones.map(z => ({
+        id: z.id,
+        name: z.name,
+        status: z.status,
+        plan: { name: z.plan?.name }
+      }));
+
+      if (isFirstPage) {
+        if (!cleanSearch) {
+          // Master list load: Overwrite and update total
+          const total = info.total_count || zones.length;
+          setAllZones(compactZones);
+          setTotalZonesCount(total);
+          setLastPageLoaded(1);
+          localStorage.setItem('cf_zones_cache', JSON.stringify(compactZones));
+          localStorage.setItem('cf_zones_timestamp', Date.now().toString());
+          localStorage.setItem('cf_zones_total', total.toString());
+          localStorage.setItem('cf_last_page', '1');
+        } else {
+          // Search results: MERGE into existing list
+          setAllZones(prev => {
+            const existingIds = new Set(prev.map(z => z.id));
+            const filtered = compactZones.filter(z => !existingIds.has(z.id));
+            const newList = [...prev, ...filtered];
+            localStorage.setItem('cf_zones_cache', JSON.stringify(newList));
+            return newList;
+          });
+        }
+      } else {
+        setAllZones(prev => {
+          const existingIds = new Set(prev.map(z => z.id));
+          const filtered = compactZones.filter(z => !existingIds.has(z.id));
+          const newList = [...prev, ...filtered];
+          localStorage.setItem('cf_zones_cache', JSON.stringify(newList));
+          localStorage.setItem('cf_last_page', page.toString());
+          return newList;
+        });
+        setLastPageLoaded(page);
+      }
+
+      if (isFirstPage && force) showToast('Zones synced successfully');
+      return { success: true, count: zones.length, total: info.total_count };
+    } catch (err) {
+      const errorMsg = err.response?.data?.error || 'Failed to sync zones';
+      if (err.response?.status !== 429) {
+        setError(errorMsg);
+        if (isFirstPage) showToast(errorMsg, 'error');
+      }
+      return null;
+    } finally {
+      if (isFirstPage) setLoading(false);
+      setIsSyncing(false);
+    }
+  };
+
+  const fetchRecords = async (zoneId) => {
+    if (safetyFreeze > 0) return;
+    setLoading(true);
+    try {
+      const res = await throttleRequest(() =>
+        axios.get(`${API_BASE}/zones/${zoneId}/dns_records`, { headers: { Authorization: apiKey } })
+      );
+      if (res) setRecords(res.data.result || []);
+    } catch {
+      if (safetyFreeze === 0) showToast('Failed to load DNS records', 'error');
     } finally {
       setLoading(false);
     }
   };
 
-  const fetchRecords = async (zoneId) => {
+  const fetchMissingBulk = async () => {
+    if (safetyFreeze > 0) return;
+    const lines = [...new Set(bulkSearchTerm.split(/[\n, ]+/).filter(t => t.trim()))];
+    if (lines.length === 0) return;
+
     setLoading(true);
-    try {
-      const res = await axios.get(`${API_BASE}/zones/${zoneId}/dns_records`, { headers: { Authorization: apiKey } });
-      setRecords(res.data.result || []);
-    } catch {
-      showToast('Failed to load DNS records', 'error');
-    } finally {
+    let newlyFound = [];
+
+    // Filter out what we already have
+    const missing = lines.filter(domain => !allZones.some(z => z.name.toLowerCase() === domain.toLowerCase()));
+
+    if (missing.length === 0) {
+      showToast('All domains are already loaded');
       setLoading(false);
+      return;
     }
+
+    showToast(`Safety Sync: Verifying ${missing.length} domains one-by-one...`, 'info');
+
+    for (const domain of missing) {
+      if (safetyFreeze > 0) break;
+
+      try {
+        const res = await throttleRequest(() =>
+          axios.get(`${API_BASE}/zones`, {
+            headers: { Authorization: apiKey },
+            params: { search: domain.toLowerCase(), per_page: 1 }
+          })
+        );
+
+        if (res) {
+          const match = (res.data.result || []).find(z => z.name.toLowerCase() === domain.toLowerCase());
+          if (match) newlyFound.push(match);
+        }
+
+        // Extra 500ms safety buffer between sequential bulk checks (results in ~1.5s total gap)
+        await new Promise(resolve => setTimeout(resolve, 500));
+      } catch (err) {
+        console.error(`Failed to fetch ${domain}`, err);
+      }
+    }
+
+    if (newlyFound.length > 0) {
+      setAllZones(prev => {
+        const existingIds = new Set(prev.map(z => z.id));
+        const filtered = newlyFound.filter(z => !existingIds.has(z.id));
+        return [...prev, ...filtered];
+      });
+      showToast(`Safety Sync: Found ${newlyFound.length} new domains`);
+    } else if (safetyFreeze === 0) {
+      showToast('No new domains found in Cloudflare matching your list', 'error');
+    }
+    setLoading(false);
   };
 
   // Domain Filtering & Bulk Matching
@@ -246,34 +454,43 @@ function App() {
 
   // Record Actions
   const deleteRecord = async (recordId) => {
+    if (!selectedZone || safetyFreeze > 0) return;
     if (!window.confirm('Are you sure you want to delete this DNS record?')) return;
     setLoading(true);
     try {
-      await axios.delete(`${API_BASE}/zones/${selectedZone.id}/dns_records/${recordId}`, {
-        headers: { Authorization: apiKey }
-      });
+      await throttleRequest(() =>
+        axios.delete(`${API_BASE}/zones/${selectedZone.id}/dns_records/${recordId}`, {
+          headers: { Authorization: apiKey }
+        })
+      );
       setRecords(prev => prev.filter(r => r.id !== recordId));
       showToast('Record deleted successfully');
-    } catch { showToast('Delete failed', 'error'); }
-    finally { setLoading(false); }
+    } catch (err) {
+      if (safetyFreeze === 0) showToast(err.response?.data?.error || 'Delete failed', 'error');
+    } finally {
+      setLoading(false);
+    }
   };
 
   const updateRecord = async (record) => {
+    if (!selectedZone || safetyFreeze > 0) return;
     setLoading(true);
     try {
-      await axios.put(`${API_BASE}/zones/${selectedZone.id}/dns_records/${record.id}`, {
-        type: record.type,
-        name: record.name,
-        content: record.content,
-        ttl: record.ttl,
-        proxied: record.proxied || false,
-        ...(getMeta(record.type).hasPriority ? { priority: record.priority } : {}),
-      }, { headers: { Authorization: apiKey } });
+      await throttleRequest(() =>
+        axios.put(`${API_BASE}/zones/${selectedZone.id}/dns_records/${record.id}`, {
+          type: record.type,
+          name: record.name,
+          content: record.content,
+          ttl: record.ttl,
+          proxied: record.proxied || false,
+          ...(getMeta(record.type).hasPriority ? { priority: record.priority } : {}),
+        }, { headers: { Authorization: apiKey } })
+      );
       await fetchRecords(selectedZone.id);
       setEditingRecord(null);
       showToast('Record updated successfully');
     } catch (err) {
-      showToast(err.response?.data?.error || 'Update failed', 'error');
+      if (safetyFreeze === 0) showToast(err.response?.data?.error || 'Update failed', 'error');
     } finally {
       setLoading(false);
     }
@@ -281,19 +498,24 @@ function App() {
 
   const bulkExecutor = async (type, payloadFn) => {
     const targetIds = selectedZone ? [selectedZone.id] : selectedZoneIds;
-    if (targetIds.length === 0) return;
+    if (targetIds.length === 0 || safetyFreeze > 0) return;
 
     setIsBulkProcessing(true);
     setBulkProgress({ current: 0, total: targetIds.length, success: [], partial: [], error: [] });
 
     for (let i = 0; i < targetIds.length; i++) {
+      if (safetyFreeze > 0) break;
       const zoneId = targetIds[i];
       const zone = allZones.find(z => z.id === zoneId);
       try {
         const data = payloadFn(zone);
-        const res = await axios.post(`${API_BASE}${data.url}`, data.body, { headers: { Authorization: apiKey } });
-        const status = (res.data.errors && res.data.errors.length > 0) ? 'partial' : 'success';
-        setBulkProgress(prev => ({ ...prev, current: i + 1, [status]: [...prev[status], { name: zone.name, errors: res.data.errors }] }));
+        const res = await throttleRequest(() =>
+          axios.post(`${API_BASE}${data.url}`, data.body, { headers: { Authorization: apiKey } })
+        );
+        if (res) {
+          const status = (res.data.errors && res.data.errors.length > 0) ? 'partial' : 'success';
+          setBulkProgress(prev => ({ ...prev, current: i + 1, [status]: [...prev[status], { name: zone.name, errors: res.data.errors }] }));
+        }
       } catch (err) {
         setBulkProgress(prev => ({ ...prev, current: i + 1, error: [...prev.error, { name: zone.name, error: err.message }] }));
       }
@@ -329,15 +551,21 @@ function App() {
   };
 
   const handleCreateZones = async () => {
+    if (safetyFreeze > 0) return;
     const list = domainsToAdd.split(/[\n, ]+/).filter(d => d.trim());
     if (list.length === 0) return;
     setIsBulkProcessing(true);
     const results = [];
     for (const d of list) {
+      if (safetyFreeze > 0) break;
       try {
-        const res = await axios.post(`${API_BASE}/zones/bulk`, { domains: [d.trim()] }, { headers: { Authorization: apiKey } });
-        const zone = res.data.results[0];
-        results.push({ name: d.trim(), status: 'success', ns: zone?.name_servers });
+        const res = await throttleRequest(() =>
+          axios.post(`${API_BASE}/zones/bulk`, { domains: [d.trim()] }, { headers: { Authorization: apiKey } })
+        );
+        if (res) {
+          const zone = res.data.results[0];
+          results.push({ name: d.trim(), status: 'success', ns: zone?.name_servers });
+        }
       } catch (err) {
         results.push({ name: d.trim(), status: 'error', error: err.response?.data?.error || err.message });
       }
@@ -348,7 +576,7 @@ function App() {
   };
 
   const handleSingleSubmit = async () => {
-    if (!newRecord.content || !selectedZone) return;
+    if (!newRecord.content || !selectedZone || safetyFreeze > 0) return;
     setLoading(true);
     try {
       const payload = {
@@ -359,12 +587,14 @@ function App() {
         ...(getMeta(newRecord.type).canProxy ? { proxied: newRecord.proxied } : {}),
         ...(getMeta(newRecord.type).hasPriority ? { priority: newRecord.priority } : {}),
       };
-      await axios.post(`${API_BASE}/zones/${selectedZone.id}/dns_records`, payload, { headers: { Authorization: apiKey } });
+      await throttleRequest(() =>
+        axios.post(`${API_BASE}/zones/${selectedZone.id}/dns_records`, payload, { headers: { Authorization: apiKey } })
+      );
       await fetchRecords(selectedZone.id);
       setNewRecord(INITIAL_RECORD);
       showToast('DNS record added');
     } catch (err) {
-      showToast(err.response?.data?.error || 'Failed to add record', 'error');
+      if (safetyFreeze === 0) showToast(err.response?.data?.error || 'Failed to add record', 'error');
     } finally {
       setLoading(false);
     }
@@ -395,14 +625,23 @@ function App() {
           ))}
         </div>
         <div className="sidebar-footer">
-          <div className="sidebar-stat">
-            <Globe size={14} />
-            <span>{allZones.length} zones</span>
+          <div className={`sidebar-stat ${safetyFreeze > 0 ? 'pulse' : ''}`} style={{ color: safetyFreeze > 0 ? 'var(--error)' : 'var(--success)', background: 'rgba(0,0,0,0.2)', padding: '8px', borderRadius: '6px' }}>
+            {safetyFreeze > 0 ? <ShieldAlert size={14} /> : <ShieldCheck size={14} />}
+            <span style={{ fontWeight: '600' }}>
+              Safety: {safetyFreeze > 0 ? `Frozen (${safetyFreeze}s)` : 'Ready'}
+            </span>
           </div>
-          <div className="sidebar-sync-time">
-            Last sync: {localStorage.getItem('cf_zones_timestamp')
-              ? new Date(parseInt(localStorage.getItem('cf_zones_timestamp'))).toLocaleTimeString()
-              : 'Never'}
+          <div className="sidebar-stat" style={{ marginTop: '0.8rem' }}>
+            <Globe size={14} />
+            <span>{totalZonesCount.toLocaleString()} zones in CF</span>
+          </div>
+          <div className="sidebar-stat" style={{ marginTop: '0.4rem', opacity: 0.8 }}>
+            <RefreshCw size={14} className={isSyncing ? 'loader' : ''} />
+            <span>
+              {isSyncing
+                ? `${allZones.length} loaded...`
+                : `${allZones.length} domains visible`}
+            </span>
           </div>
         </div>
       </div>
@@ -415,10 +654,16 @@ function App() {
             {selectedZone && <span className="breadcrumb">DNS Management</span>}
           </div>
           <div className="top-bar-right">
+            {requestQueueActive && <div className="badge badge-info" style={{ display: 'flex', alignItems: 'center', gap: '4px' }}><Loader2 size={12} className="loader" /> Queueing...</div>}
             {selectedZoneIds.length > 0 && (
               <div className="badge badge-info">{selectedZoneIds.length} selected</div>
             )}
-            <button className="btn-secondary" onClick={() => fetchZones(true)} disabled={loading}>
+            <button
+              className="btn-secondary"
+              onClick={() => fetchZones(true)}
+              disabled={loading || safetyFreeze > 0}
+              title={safetyFreeze > 0 ? `Safety Freeze enabled (${safetyFreeze}s)` : 'Sync zones'}
+            >
               <RefreshCw size={15} className={loading ? 'loader' : ''} />
               Sync
             </button>
@@ -426,6 +671,18 @@ function App() {
         </header>
 
         <main className="content-area">
+          {safetyFreeze > 0 && (
+            <div className="alert-error" style={{ marginBottom: '1.5rem', animation: 'pulse 1.5s infinite' }}>
+              <ShieldAlert size={20} />
+              <div style={{ flex: 1 }}>
+                <strong>Safety Freeze Active</strong>
+                <p style={{ fontSize: '0.85rem', margin: '4px 0 0' }}>
+                  Cloudflare rate limits reached. Cooling down account for {safetyFreeze} seconds to prevent suspension.
+                </p>
+              </div>
+              <div style={{ fontSize: '1.5rem', fontWeight: 'bold' }}>{safetyFreeze}s</div>
+            </div>
+          )}
           {error && (
             <div className="alert-error">
               <ShieldAlert size={18} />
@@ -442,8 +699,13 @@ function App() {
                 <div className="stat-card">
                   <div className="stat-icon" style={{ background: 'rgba(99, 102, 241, 0.1)', color: '#818cf8' }}><Globe size={22} /></div>
                   <div>
-                    <div className="stat-label">Total Zones</div>
-                    <div className="stat-value">{allZones.length}</div>
+                    <div className="stat-label">Total Cloudflare Zones</div>
+                    <div className="stat-value">
+                      {totalZonesCount}
+                      <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginLeft: '0.5rem', fontWeight: 'normal' }}>
+                        ({allZones.length} loaded)
+                      </span>
+                    </div>
                   </div>
                 </div>
                 <div className="stat-card">
@@ -472,21 +734,45 @@ function App() {
 
                   {searchMode === 'simple' ? (
                     <div className="search-input-wrapper">
-                      <Search className="search-icon" size={15} />
-                      <input
-                        type="text"
-                        placeholder="Filter domains..."
-                        value={searchTerm}
-                        onChange={e => { setSearchTerm(e.target.value); setCurrentPage(1); }}
-                      />
+                      <div className="search-input-container">
+                        <Search className="search-icon" size={15} />
+                        <input
+                          type="text"
+                          placeholder="Search locally or press Enter for CF..."
+                          value={searchTerm}
+                          onChange={e => setSearchTerm(e.target.value)}
+                          onKeyDown={e => e.key === 'Enter' && fetchZones(false, searchTerm, 1)}
+                        />
+                        <button
+                          className="btn-ghost"
+                          style={{ position: 'absolute', right: '4px', height: '80%', display: 'flex', alignItems: 'center' }}
+                          onClick={() => fetchZones(false, searchTerm, 1)}
+                          title={safetyFreeze > 0 ? `Safety Freeze enabled (${safetyFreeze}s)` : 'Deep Search Cloudflare'}
+                          disabled={loading || safetyFreeze > 0}
+                        >
+                          {loading ? <Loader2 size={14} className="loader" /> : <Search size={14} />}
+                        </button>
+                        <div className="search-hint">Press <strong>Enter</strong> to search all 10k+ domains</div>
+                      </div>
                     </div>
                   ) : (
-                    <div className="bulk-hint">
-                      <Info size={13} /> Paste domain list below to filter
+                    <div className="card-toolbar-right" style={{ display: 'flex', gap: '8px', alignItems: 'center', flex: 1 }}>
+                      <div className="bulk-hint">
+                        <Info size={13} /> Paste domain list below
+                      </div>
+                      <button
+                        className="btn-secondary btn-sm"
+                        onClick={fetchMissingBulk}
+                        disabled={loading || safetyFreeze > 0 || !bulkSearchTerm.trim()}
+                        title={safetyFreeze > 0 ? `Safety Freeze enabled (${safetyFreeze}s)` : 'Sync missing from CF'}
+                      >
+                        {loading ? <Loader2 size={14} className="loader" /> : <RefreshCw size={14} />}
+                        Sync Missing from CF
+                      </button>
                     </div>
                   )}
 
-                  <button className="btn-secondary" onClick={selectAllFiltered}>
+                  <button className="btn-secondary" style={{ height: '38px' }} onClick={selectAllFiltered}>
                     {selectedZoneIds.length === filteredZones.length && filteredZones.length > 0 ? 'Deselect All' : 'Select All'}
                   </button>
                 </div>
@@ -515,9 +801,20 @@ function App() {
                     </thead>
                     <tbody>
                       {paginatedZones.length === 0 && (
-                        <tr><td colSpan="5" className="empty-state">
-                          {allZones.length === 0 ? 'No zones found. Add your API key in Settings.' : 'No matching domains.'}
-                        </td></tr>
+                        <tr>
+                          <td colSpan="5" className="empty-state">
+                            {searchTerm ? (
+                              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px' }}>
+                                <p>No domains match "{searchTerm}" in the {allZones.length} loaded zones.</p>
+                                <button className="btn-secondary btn-sm" onClick={() => fetchZones(false, searchTerm, 1)} disabled={loading || safetyFreeze > 0}>
+                                  <Search size={14} /> Search all 10k+ Cloudflare domains
+                                </button>
+                              </div>
+                            ) : (
+                              allZones.length === 0 ? 'No zones found. Add your API key in Settings.' : 'No domains loaded yet.'
+                            )}
+                          </td>
+                        </tr>
                       )}
                       {paginatedZones.map(zone => (
                         <tr key={zone.id} className={selectedZoneIds.includes(zone.id) ? 'row-selected' : ''}>
@@ -562,6 +859,36 @@ function App() {
                     <button className="btn-secondary btn-sm" disabled={currentPage >= totalPages} onClick={() => setCurrentPage(p => p + 1)}><ChevronRight size={15} /></button>
                   </div>
                 )}
+
+                {isSyncingAll && (
+                  <div className="discovery-progress">
+                    <div className="progress-info">
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <Loader2 size={14} className="loader" />
+                        <span>Syncing all domains...</span>
+                      </div>
+                      <span>{allZones.length.toLocaleString()} / {totalZonesCount.toLocaleString()}</span>
+                    </div>
+                    <div className="progress-bar-container">
+                      <div
+                        className="progress-bar-fill"
+                        style={{ width: `${(allZones.length / totalZonesCount) * 100}%` }}
+                      ></div>
+                    </div>
+                  </div>
+                )}
+
+                {isSyncing && (
+                  <div className="sync-progress-bar">
+                    <div className="sync-progress-fill-container">
+                      <div className="sync-progress-fill" style={{ width: `${Math.min(100, (allZones.length / totalZonesCount) * 100)}%` }}></div>
+                    </div>
+                    <div className="sync-status-text">
+                      <RefreshCw size={12} className="loader" />
+                      Syncing {allZones.length} of {totalZonesCount} domains...
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Bulk Action Bar */}
@@ -572,10 +899,20 @@ function App() {
                     <button className="btn-ghost" onClick={() => setSelectedZoneIds([])}>Clear</button>
                   </div>
                   <div className="action-bar-right">
-                    <button className="btn-primary" onClick={() => setShowBulkDNSModal(true)}>
+                    <button
+                      className="btn-primary"
+                      onClick={() => setShowBulkDNSModal(true)}
+                      disabled={safetyFreeze > 0}
+                      title={safetyFreeze > 0 ? `Safety Freeze enabled (${safetyFreeze}s)` : 'Update DNS for selected'}
+                    >
                       <ShieldCheck size={16} /> Bulk DNS
                     </button>
-                    <button className="btn-primary btn-purple" onClick={() => setShowForwardingModal(true)}>
+                    <button
+                      className="btn-primary btn-purple"
+                      onClick={() => setShowForwardingModal(true)}
+                      disabled={safetyFreeze > 0}
+                      title={safetyFreeze > 0 ? `Safety Freeze enabled (${safetyFreeze}s)` : 'Bulk Forwarding'}
+                    >
                       <LinkIcon size={16} /> URL Forwarding
                     </button>
                   </div>
@@ -595,7 +932,12 @@ function App() {
                   </button>
                 </div>
                 <div className="dns-header-actions">
-                  <button className="btn-secondary" onClick={() => fetchRecords(selectedZone.id)} disabled={loading}>
+                  <button
+                    className="btn-secondary"
+                    onClick={() => fetchRecords(selectedZone.id)}
+                    disabled={loading || safetyFreeze > 0}
+                    title={safetyFreeze > 0 ? `Safety Freeze enabled (${safetyFreeze}s)` : 'Refresh DNS records'}
+                  >
                     <RefreshCw size={14} className={loading ? 'loader' : ''} /> Refresh
                   </button>
                 </div>
@@ -831,8 +1173,8 @@ function App() {
                                 )}
                               </td>
                               <td className="actions-cell">
-                                <button className="btn-icon" onClick={() => setEditingRecord({ ...r })} title="Edit"><Edit3 size={14} /></button>
-                                <button className="btn-icon btn-danger" onClick={() => deleteRecord(r.id)} title="Delete"><Trash2 size={14} /></button>
+                                <button className="btn-icon" onClick={() => setEditingRecord({ ...r })} title={safetyFreeze > 0 ? `Safety Freeze enabled (${safetyFreeze}s)` : 'Edit'} disabled={safetyFreeze > 0}><Edit3 size={14} /></button>
+                                <button className="btn-icon btn-danger" onClick={() => deleteRecord(r.id)} title={safetyFreeze > 0 ? `Safety Freeze enabled (${safetyFreeze}s)` : 'Delete'} disabled={safetyFreeze > 0}><Trash2 size={14} /></button>
                               </td>
                             </>
                           )}
@@ -860,7 +1202,12 @@ function App() {
               />
 
               <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', marginTop: '1.5rem' }}>
-                <button className="btn-primary" onClick={handleCreateZones} disabled={isBulkProcessing || !domainsToAdd.trim()}>
+                <button
+                  className="btn-primary"
+                  onClick={handleCreateZones}
+                  disabled={isBulkProcessing || !domainsToAdd.trim() || safetyFreeze > 0}
+                  title={safetyFreeze > 0 ? `Safety Freeze enabled (${safetyFreeze}s)` : 'Create zones'}
+                >
                   {isBulkProcessing ? <Loader2 className="loader" size={16} /> : <PlusCircle size={16} />}
                   Create Zones
                 </button>
@@ -1052,11 +1399,12 @@ function App() {
             </div>
             <div className="modal-body">
               <p className="text-muted" style={{ marginBottom: '1.5rem' }}>
-                Redirect traffic for <strong>{selectedZoneIds.length}</strong> domains. Use <code>{'{{DOMAIN}}'}</code> as a placeholder.
+                Redirect traffic for <strong>{selectedZoneIds.length}</strong> domains. Use <code>{'{{DOMAIN}}'}</code> for the domain and <code>*</code> for wildcards.
               </p>
               <div className="form-group" style={{ marginBottom: '1rem' }}>
                 <label>Source URL</label>
                 <input type="text" placeholder="{{DOMAIN}}/*" value={redirectSource} onChange={e => setRedirectSource(e.target.value)} />
+                <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: '0.3rem', display: 'block' }}>Use <code>*</code> as a wildcard. e.g. <code>{'{{DOMAIN}}/*'}</code> matches all paths.</span>
               </div>
               <div className="redirect-arrow"><ArrowRight size={20} /></div>
               <div className="form-group">

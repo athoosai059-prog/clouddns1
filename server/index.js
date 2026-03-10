@@ -28,39 +28,40 @@ const handleError = (res, error) => {
     });
 };
 
-// List Zones (Domains) with pagination support
+// List Zones (Domains) with pagination and search support
 app.get('/api/zones', async (req, res) => {
     try {
-        console.log('--- Fetching Zones ---');
-        let allZones = [];
-        let page = 1;
-        let totalPages = 1;
+        const { search, page = 1, per_page = 50 } = req.query;
+        console.log(`--- Fetching Zones (Page: ${page}, Search: "${search || 'None'}") ---`);
 
-        do {
-            console.log(`Requesting page ${page}...`);
-            const response = await axios.get(`${CLOUDFLARE_API_URL}/zones`, {
-                headers: getHeaders(req),
-                params: {
-                    page: page,
-                    per_page: 50,
-                    direction: 'asc'
-                }
-            });
+        const params = {
+            page: page,
+            per_page: per_page,
+            direction: 'asc',
+            status: 'active'
+        };
 
-            if (response.data.success) {
-                const { result, result_info } = response.data;
-                allZones = [...allZones, ...result];
-                totalPages = result_info.total_pages;
-                console.log(`Received ${result.length} zones. Total so far: ${allZones.length} / ${result_info.total_count}`);
-                page++;
-            } else {
-                throw new Error('Cloudflare API returned success: false');
-            }
-        } while (page <= totalPages);
+        // Cloudflare's name filter typically expects an exact match for the zone name.
+        // If a search term is provided, we pass it as is.
+        if (search) {
+            params.name = search;
+        }
 
-        console.log(`Fetch complete. Sending ${allZones.length} zones to frontend.`);
-        res.json({ result: allZones });
+        const response = await axios.get(`${CLOUDFLARE_API_URL}/zones`, {
+            headers: getHeaders(req),
+            params
+        });
+
+        if (response.data.success) {
+            res.json(response.data);
+        } else {
+            console.error('Cloudflare Error Body:', JSON.stringify(response.data, null, 2));
+            throw new Error('Cloudflare API returned success: false');
+        }
     } catch (error) {
+        if (error.response) {
+            console.error('Cloudflare Error Details (400):', JSON.stringify(error.response.data, null, 2));
+        }
         console.error('Zone fetch error:', error.message);
         handleError(res, error);
     }
@@ -164,61 +165,53 @@ app.post('/api/zones/bulk', async (req, res) => {
     res.json({ success: true, results, errors });
 });
 
-// Create Redirect Rule (URL Forwarding)
-// Cloudflare uses Rulesets for Redirect Rules now.
+// Create Redirect Rule (URL Forwarding) via Page Rules
+// Page Rules API works on all plans and only requires Zone > Page Rules: Edit permission.
 app.post('/api/zones/:id/redirect_rules', async (req, res) => {
     try {
         const zoneId = req.params.id;
         const { source_url, target_url, status_code = 301 } = req.body;
 
-        // 1. Get current ruleset for dynamic redirects
-        const rulesetsRes = await axios.get(`${CLOUDFLARE_API_URL}/zones/${zoneId}/rulesets`, {
-            headers: getHeaders(req)
-        });
+        console.log('--- Creating Page Rule ---');
+        console.log('Zone ID:', zoneId);
+        console.log('Source:', source_url, '→ Target:', target_url, '| Status:', status_code);
 
-        const redirectRuleset = rulesetsRes.data.result.find(r => r.phase === 'http_request_dynamic_redirect');
-
-        let rulesetId;
-        let existingRules = [];
-
-        if (redirectRuleset) {
-            rulesetId = redirectRuleset.id;
-            const fullRuleset = await axios.get(`${CLOUDFLARE_API_URL}/zones/${zoneId}/rulesets/${rulesetId}`, {
-                headers: getHeaders(req)
-            });
-            existingRules = fullRuleset.data.result.rules || [];
-        } else {
-            // Create ruleset if it doesn't exist
-            const newRuleset = await axios.post(`${CLOUDFLARE_API_URL}/zones/${zoneId}/rulesets`, {
-                name: 'Default Redirect Ruleset',
-                phase: 'http_request_dynamic_redirect',
-                kind: 'zone'
-            }, { headers: getHeaders(req) });
-            rulesetId = newRuleset.data.result.id;
-        }
-
-        // 2. Add new rule
-        const newRule = {
-            action: 'redirect',
-            action_parameters: {
-                from_value: {
-                    status_code,
-                    target_url: { value: target_url },
-                    preserve_query_string: true
+        const payload = {
+            targets: [
+                {
+                    target: 'url',
+                    constraint: {
+                        operator: 'matches',
+                        value: source_url
+                    }
                 }
-            },
-            expression: `(http.request.full_uri eq "${source_url}") or (http.host eq "${source_url}")`,
-            description: `Redirect from ${source_url}`
+            ],
+            actions: [
+                {
+                    id: 'forwarding_url',
+                    value: {
+                        url: target_url,
+                        status_code: status_code
+                    }
+                }
+            ],
+            status: 'active'
         };
 
-        const updatedRules = [...existingRules, newRule];
+        console.log('Payload:', JSON.stringify(payload, null, 2));
 
-        const response = await axios.put(`${CLOUDFLARE_API_URL}/zones/${zoneId}/rulesets/${rulesetId}`, {
-            rules: updatedRules
-        }, { headers: getHeaders(req) });
+        const response = await axios.post(
+            `${CLOUDFLARE_API_URL}/zones/${zoneId}/pagerules`,
+            payload,
+            { headers: getHeaders(req) }
+        );
+
+        console.log('Response success:', response.data.success);
+        console.log('Response:', JSON.stringify(response.data, null, 2));
 
         res.json(response.data);
     } catch (error) {
+        console.error('Page Rule Error:', error.response?.data || error.message);
         handleError(res, error);
     }
 });
